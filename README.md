@@ -154,8 +154,11 @@ container, sem permissões adicionais, e contém:
 Os diretórios `data` e `workspace` são montados no container em `/opt/data` e
 `/workspace`, respectivamente. O compose também monta
 `/home/hermes/data/.gemini/antigravity-cli` em
-`/home/hermes/.gemini/antigravity-cli`, preservando os dados de autenticação do
-Antigravity CLI. O diretório `/workspace` é usado como diretório de trabalho.
+`/home/hermes/.gemini/antigravity-cli`. Como o gateway usa `HOME=/opt/data`,
+seu caminho padrão para os dados do Antigravity CLI é `/opt/data/.gemini`; a
+diferença entre esse caminho e o destino do mount está detalhada na seção de
+autenticação abaixo. O diretório `/workspace` é usado como diretório de
+trabalho.
 
 O conteúdo do `compose.yaml` é:
 
@@ -168,7 +171,7 @@ services:
     userns_mode: "keep-id:uid=10000,gid=10000"
     user: "0:0"
     extra_hosts:
-      - "host.example.invalid:host-gateway"
+      - "host.example.invalid:host-gateway" # nome real do host omitido
     volumes:
       - /home/hermes/data:/opt/data
       - /home/hermes/workspace:/workspace
@@ -223,6 +226,29 @@ segurança antes de mudanças importantes. Arquivos criados no host dentro dessa
 árvore ficam disponíveis pelo caminho correspondente em `/opt/data` no
 container.
 
+## Autenticação do Codex e do Antigravity CLI
+
+O processo do gateway usa `HOME=/opt/data`; assim, os caminhos padrão das
+credenciais são `/opt/data/.codex` para o Codex e `/opt/data/.gemini` para o
+Antigravity CLI (`agy`). Não é necessário criar links simbólicos nem alterar o
+`HOME` do gateway para essas ferramentas.
+
+O shell auxiliar aberto pela ferramenta de terminal usou incorretamente
+`HOME=/opt/data/home`. Por isso, o `agy` solicitou login nesse shell, embora
+tenha respondido quando o `HOME` era `/opt/data`; o Codex também reconheceu a
+conta nesse caminho. As credenciais criadas no local incorreto foram movidas
+para `/opt/data`, e os testes seguintes confirmaram a autenticação:
+
+```text
+Codex: CODEX_AUTH_OK
+AGY:   AGY_AUTH_OK
+```
+
+Em um teste anterior, o Codex respondeu “Olá! Como posso ajudar com o projeto?”
+e o AGY retornou `HELLO_AGY`. Até que o shell auxiliar herde o `HOME` correto,
+defina `HOME=/opt/data` ao executar testes nele. Essa diferença de ambiente do
+shell não altera a configuração do gateway.
+
 ## Mensageria
 
 Foi testada uma integração com XMPP para comunicação remota. Apesar do tempo
@@ -250,3 +276,12 @@ usar diretamente, no código, modelos disponibilizados por planos como Claude
 Pro, ChatGPT Plus e OpenCode Go. Nesse fluxo, o Nemotron usado no Hermes atua
 como orientador das atividades; os modelos acessados pelos harnesses são os
 responsáveis pela execução do código.
+
+O Code Mode permite ao modelo orquestrar várias chamadas a ferramentas por
+meio de código JavaScript, por exemplo percorrendo resultados e filtrando ou
+agregando respostas. Não é necessário para tarefas comuns como editar arquivos
+ou executar testes; consulte a
+[documentação de chamadas programáticas a ferramentas](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling/).
+O host auxiliar do Code Mode não estava disponível durante a configuração,
+portanto esse recurso específico não foi validado. Os testes simples do Codex
+e do AGY funcionaram sem ele.
