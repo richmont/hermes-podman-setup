@@ -7,6 +7,44 @@ A máquina host precisa ter o Podman e o `podman-compose` instalados. O containe
 gerenciamento devem ser executados nesse contexto, por exemplo com
 `sudo -u hermes podman ...`.
 
+## Inicialização pelo systemd
+
+O serviço `hermes-compose` inicia o Compose no boot e o encerra ao parar o
+serviço. Ele roda como o usuário e grupo `hermes`, com `/etc/hermes` como
+diretório de trabalho:
+
+```ini
+[Unit]
+Description=Hermes Agent - Podman Compose Rootless
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+User=hermes
+Group=hermes
+
+Environment=HOME=/home/hermes
+Environment=XDG_RUNTIME_DIR=/run/user/1001
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+WorkingDirectory=/etc/hermes
+ExecStart=/usr/bin/podman-compose --in-pod=false -f /etc/hermes/compose.yaml up -d
+ExecStop=/usr/bin/podman-compose --in-pod=false -f /etc/hermes/compose.yaml down
+
+TimeoutStartSec=180
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target
+```
+
+O arquivo da unidade fica em `/etc/systemd/system/hermes-compose.service`.
+`XDG_RUNTIME_DIR` aponta para `/run/user/1001` neste host; esse valor depende do
+UID atribuído ao usuário `hermes` no sistema.
+
 ## Acessar o terminal do container
 
 Na máquina host, use o comando abaixo para abrir um Bash interativo no container
