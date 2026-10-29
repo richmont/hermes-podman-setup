@@ -45,6 +45,28 @@ O arquivo da unidade fica em `/etc/systemd/system/hermes-compose.service`.
 `XDG_RUNTIME_DIR` aponta para `/run/user/1001` neste host; esse valor depende do
 UID atribuído ao usuário `hermes` no sistema.
 
+## Reconstruir a imagem e recriar o container
+
+Após alterar o `Containerfile` — por exemplo, para adicionar ferramentas como
+`agy` e `codex` — reconstrua a imagem e recrie o container como usuário
+`hermes`:
+
+```bash
+sudo -u hermes podman build -t localhost/hermes-opencode:2 -f /etc/hermes/Containerfile /etc/hermes
+sudo -u hermes podman-compose --in-pod=false -f /etc/hermes/compose.yaml up -d --force-recreate
+```
+
+Para conferir se as ferramentas estão disponíveis dentro do container, execute
+os comandos abaixo no host:
+
+```bash
+sudo -u hermes podman exec hermes-agent opencode --version
+sudo -u hermes podman exec hermes-agent ccusage --version
+sudo -u hermes podman exec hermes-agent codex --version
+sudo -u hermes podman exec hermes-agent agy --version
+sudo -u hermes podman exec hermes-agent tmux -V
+```
+
 ## Acessar o terminal do container
 
 Na máquina host, use o comando abaixo para abrir um Bash interativo no container
@@ -69,11 +91,13 @@ Os arquivos usados para configurar e executar o container ficam no host em
 ```
 
 O `Containerfile` parte da imagem `docker.io/nousresearch/hermes-agent:stable`.
-Como `root`, instala `curl`, `ca-certificates`, `tmux`, `git` e `procps`, além
-das ferramentas Antigravity CLI (`agy`), Codex CLI (`codex`), OpenCode
-(`opencode`) e `ccusage`. No final, volta para o usuário `hermes` e define
-`/workspace` como diretório de trabalho. Assim, essas ferramentas já ficam
-disponíveis no ambiente do container.
+Como `root`, instala `curl`, `ca-certificates`, `tmux`, `git`, `procps`, `sudo`,
+`tree` e `mlocate`, além das ferramentas Antigravity CLI (`agy`), Codex CLI
+(`codex`), OpenCode (`opencode`) e `ccusage`. O executável do Codex é copiado
+com os links simbólicos resolvidos para `/usr/local/bin/codex` e recebe
+permissão de execução, tornando-o acessível ao usuário `hermes` também. No
+final, a imagem volta para o usuário `hermes` e define `/workspace` como
+diretório de trabalho.
 
 O conteúdo usado para construir a imagem é:
 
@@ -84,7 +108,7 @@ USER root
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl ca-certificates tmux git procps \
+        curl ca-certificates tmux git procps sudo tree mlocate \
     && rm -rf /var/lib/apt/lists/*
 
 # Antigravity CLI (agy)
@@ -94,7 +118,8 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
 
 # Codex CLI (instalador standalone oficial)
 RUN curl -fsSL https://chatgpt.com/codex/install.sh | sh \
-    && mv /root/.local/bin/codex /usr/local/bin/codex \
+    && cp -L /root/.local/bin/codex /usr/local/bin/codex \
+    && chmod +x /usr/local/bin/codex \
     && codex --version
 
 # OpenCode
