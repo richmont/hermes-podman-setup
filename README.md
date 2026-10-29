@@ -226,6 +226,33 @@ segurança antes de mudanças importantes. Arquivos criados no host dentro dessa
 árvore ficam disponíveis pelo caminho correspondente em `/opt/data` no
 container.
 
+**Pendência futura:** implementar um backup reproduzível dos arquivos
+persistidos do container e do ambiente no host. Preservar, no mínimo:
+
+- `/home/hermes/workspace/` — projetos, inclusive alterações ainda não
+  commitadas;
+- `/home/hermes/config/` e `/home/hermes/container/` — configurações prontas
+  mantidas nessas pastas;
+- `/home/hermes/data/` — configuração e estado persistido do Hermes;
+- `/etc/hermes/Containerfile` e `/etc/hermes/compose.yaml` — arquivos usados
+  para construir e iniciar o container.
+
+Oferecer dois modos explícitos. No **backup seguro**, preservar os caminhos
+acima, mas ignorar as credenciais `/home/hermes/data/.codex/` e
+`/home/hermes/data/.gemini/` (equivalentes a `/opt/data/.codex/` e
+`/opt/data/.gemini/` dentro do container), além de excluir ou sanitizar
+`/home/hermes/data/config.yaml`, que pode conter o `GH_TOKEN` e outras chaves.
+Também ignorar arquivos temporários descartáveis, como
+`/home/hermes/data/cache/scratch/`. O processo deve registrar que as
+credenciais precisarão ser configuradas novamente após a restauração.
+
+No **backup inseguro**, incluir também esses diretórios de credenciais e o
+`config.yaml` original para restaurar a autenticação e as configurações sem
+reconfiguração; avisar claramente que o arquivo contém segredos e protegê-lo
+com acesso restrito e armazenamento seguro. Em ambos os modos, definir como
+tratar outras credenciais que venham a ser adicionadas, restaurar permissões e
+validar a recuperação do ambiente.
+
 ## Autenticação do Codex e do Antigravity CLI
 
 O processo do gateway usa `HOME=/opt/data`; assim, os caminhos padrão das
