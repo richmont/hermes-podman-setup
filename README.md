@@ -282,6 +282,15 @@ meio de código JavaScript, por exemplo percorrendo resultados e filtrando ou
 agregando respostas. Não é necessário para tarefas comuns como editar arquivos
 ou executar testes; consulte a
 [documentação de chamadas programáticas a ferramentas](https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling/).
-O host auxiliar do Code Mode não estava disponível durante a configuração,
-portanto esse recurso específico não foi validado. Os testes simples do Codex
-e do AGY funcionaram sem ele.
+O provider `openai-codex` do Hermes estava habilitado e autenticado. Um teste
+com `gpt-6-luna` respondeu `HERMES_CODEX_PROVIDER_OK` sem alterar o modelo
+global do Hermes. Para validar a criação de arquivo com o Codex e Code Mode,
+foi usada uma instalação oficial isolada em scratch, pois o host auxiliar
+compatível não está instalado na instalação global do container. O executável
+global não foi substituído.
+
+Como solução provisória, o Hermes baixou e usou o executável standalone em um
+diretório scratch. **Pendência futura:** persistir a correção diretamente no
+container, instalando/configurando o host auxiliar compatível com Code Mode
+para o Codex global. Até lá, usar a solução local via Hermes e executável
+standalone baixado.
