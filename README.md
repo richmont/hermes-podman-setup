@@ -376,6 +376,163 @@ container do banco (a senha é solicitada interativamente):
 sudo -u hermes podman exec -it hermes-mariadb mariadb -u root -p
 ```
 
+### Criar banco e usuário para um projeto
+
+Cada projeto em `/home/hermes/workspace` pode ter um banco e um usuário
+próprios, restritos a esse banco. As credenciais ficam no `.env` do projeto,
+com variáveis nomeadas por um prefixo. Nos exemplos abaixo, substitua
+`PROJETO` pelo prefixo do projeto, `<banco>` e `<usuario>` pelos nomes do banco
+e do usuário (letras minúsculas, números e `_`) e `<projeto>` pelo diretório
+do projeto:
+
+| Variável | Conteúdo |
+|---|---|
+| `PROJETO_DB` | nome do banco |
+| `PROJETO_MARIADB_LOGIN` | usuário do banco |
+| `PROJETO_MARIADB_PW` | senha do usuário |
+| `PROJETO_URI` | string de conexão usada pela aplicação |
+
+#### 1. Criar o `.env` do projeto
+
+Gere uma senha hexadecimal: ela não precisa de escape em SQL, em URI nem em
+arquivos `.env`. Execute como `hermes`, ajustando o diretório do projeto:
+
+```bash
+sudo -u hermes bash -c '
+cd /home/hermes/workspace/<projeto>
+umask 077
+pw=$(openssl rand -hex 24)
+cat >> .env <<EOF
+PROJETO_DB=<banco>
+PROJETO_MARIADB_LOGIN=<usuario>
+PROJETO_MARIADB_PW=$pw
+PROJETO_URI=mysql://<usuario>:$pw@mariadb:3306/<banco>
+EOF
+chmod 600 .env
+grep -qxF .env .gitignore 2>/dev/null || echo .env >> .gitignore
+'
+```
+
+As variáveis são acrescentadas ao final do `.env`, se ele já existir. O `.env`
+fica com permissão `600` e é adicionado ao
+`.gitignore` para a senha não ser commitada. O esquema `mysql://` atende a
+maioria das bibliotecas; algumas exigem outro, como `mysql+pymysql://` no
+SQLAlchemy.
+
+#### 2. Script de criação
+
+Salve o script em `/etc/hermes/create-project-db.sh`:
+
+```bash
+#!/usr/bin/env bash
+# Uso: create-project-db.sh <arquivo-env> <PREFIXO>
+# Lê <PREFIXO>_DB, <PREFIXO>_MARIADB_LOGIN e <PREFIXO>_MARIADB_PW do arquivo,
+# cria o banco e o usuário no hermes-mariadb e testa o login pelo hermes-agent.
+# Pode ser executado de novo: sincroniza a senha e mantém os dados.
+set -euo pipefail
+
+env_file=${1:?informe o arquivo .env}
+prefix=${2:?informe o prefixo, ex.: PROJETO}
+
+# Lê o valor sem executar o arquivo como shell
+get() {
+    { grep -E "^(export )?${prefix}_$1=" "$env_file" || true; } | tail -n 1 | cut -d= -f2-
+}
+
+db=$(get DB)
+user=$(get MARIADB_LOGIN)
+pw=$(get MARIADB_PW)
+
+[[ $db =~ ^[a-z0-9_]{1,64}$ ]]   || { echo "nome de banco inválido: '$db'" >&2; exit 1; }
+[[ $user =~ ^[a-z0-9_]{1,80}$ ]] || { echo "login inválido: '$user'" >&2; exit 1; }
+[[ $pw =~ ^[A-Za-z0-9]{16,}$ ]]  || { echo "senha deve ter 16+ caracteres alfanuméricos" >&2; exit 1; }
+
+# A senha do root vem do ambiente do próprio container (env_file do compose)
+podman exec -i hermes-mariadb \
+    sh -c 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" exec mariadb -uroot' <<SQL
+CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS '$user'@'%' IDENTIFIED BY '$pw';
+ALTER USER '$user'@'%' IDENTIFIED BY '$pw';
+GRANT ALL PRIVILEGES ON \`$db\`.* TO '$user'@'%';
+SQL
+
+# Testa o login como o novo usuário, a partir do container do Hermes.
+# A senha é repassada pelo ambiente (-e MYSQL_PWD sem valor), fora da
+# linha de comando; --no-defaults ignora o .my.cnf do usuário hermes.
+MYSQL_PWD=$pw podman exec -e MYSQL_PWD hermes-agent \
+    mariadb --no-defaults -h mariadb -u "$user" "$db" \
+    -e "SELECT CURRENT_USER() AS usuario, DATABASE() AS banco;"
+
+echo "OK: banco '$db' e usuário '$user' prontos."
+```
+
+```bash
+sudo install -m 755 /dev/null /etc/hermes/create-project-db.sh
+sudo nano /etc/hermes/create-project-db.sh
+```
+
+O script valida os nomes e a senha antes de montá-los no SQL, o que evita
+injeção por um `.env` malformado, e lê o arquivo com `grep` em vez de
+executá-lo com `source`.
+
+#### 3. Executar
+
+Execute como `hermes`, nunca como `root`: o `.env` fica em `/workspace`, onde
+o agente também escreve, e o Podman rootless já roda como esse usuário.
+
+```bash
+sudo -u hermes /etc/hermes/create-project-db.sh /home/hermes/workspace/<projeto>/.env PROJETO
+```
+
+Saída esperada:
+
+```text
+usuario        banco
+<usuario>@%    <banco>
+OK: banco '<banco>' e usuário '<usuario>' prontos.
+```
+
+Para outro projeto, repita os passos 1 e 3 com o diretório e o prefixo dele.
+
+#### Alternativa: criação manual
+
+Se o `.env` já foi criado à mão, os mesmos comandos podem ser executados
+diretamente no console do `root`. Abra o console (a senha é o
+`MARIADB_ROOT_PASSWORD`):
+
+```bash
+sudo -u hermes podman exec -it hermes-mariadb mariadb -u root -p
+```
+
+Cole os comandos com os valores de `PROJETO_DB`, `PROJETO_MARIADB_LOGIN` e
+`PROJETO_MARIADB_PW` do `.env`, repetindo o bloco para cada projeto:
+
+```sql
+CREATE DATABASE IF NOT EXISTS `<banco>` CHARACTER SET utf8mb4;
+CREATE USER IF NOT EXISTS '<usuario>'@'%' IDENTIFIED BY '<senha>';
+GRANT ALL PRIVILEGES ON `<banco>`.* TO '<usuario>'@'%';
+SHOW GRANTS FOR '<usuario>'@'%';
+```
+
+O nome do banco fica entre crases; usuário e senha, entre aspas simples. Se a
+senha contiver `'` ou `\`, preceda o caractere com `\`. O `SHOW GRANTS` deve
+listar apenas `GRANT USAGE ON *.*` e `GRANT ALL PRIVILEGES ON <banco>.*`. Saia
+com `exit`. Para trocar a senha de um usuário existente, use
+`ALTER USER '<usuario>'@'%' IDENTIFIED BY '<nova-senha>';` e atualize o `.env`.
+Para conferir os bancos e usuários existentes:
+
+```bash
+sudo -u hermes podman exec hermes-mariadb sh -c \
+    'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot -e "SHOW DATABASES; SELECT User, Host FROM mysql.user;"'
+```
+
+Para remover um projeto — apaga **todos os dados** do banco:
+
+```sql
+DROP DATABASE `<banco>`;
+DROP USER '<usuario>'@'%';
+```
+
 ## Checklist de manutenção
 
 Use esta lista após a instalação inicial, depois de reiniciar o host,
