@@ -29,6 +29,7 @@ Group=hermes
 Environment=HOME=/home/hermes
 Environment=XDG_RUNTIME_DIR=/run/user/1001
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/etc/hermes/hermes-mariadb.conf
 
 WorkingDirectory=/etc/hermes
 ExecStart=/usr/bin/podman-compose --in-pod=false -f /etc/hermes/compose.yaml up -d
@@ -44,6 +45,14 @@ WantedBy=multi-user.target
 O arquivo da unidade fica em `/etc/systemd/system/hermes-compose.service`.
 `XDG_RUNTIME_DIR` aponta para `/run/user/1001` neste host; esse valor depende do
 UID atribuído ao usuário `hermes` no sistema.
+
+O `EnvironmentFile` carrega as variáveis do MariaDB no ambiente do processo
+`podman-compose`. Os containers não recebem esse ambiente diretamente: o
+serviço `mariadb` lê o mesmo arquivo pelo `env_file` do `compose.yaml`. O
+`EnvironmentFile` só tem efeito se o `compose.yaml` usar interpolação, como
+`${MARIADB_PASSWORD}`, e não é carregado quando o `podman-compose` é executado
+manualmente com `sudo -u hermes`. O systemd lê o arquivo como `root` antes de
+trocar para o usuário `hermes`, então a permissão `600` não impede a leitura.
 
 ## Reconstruir a imagem e recriar o container
 
@@ -87,12 +96,14 @@ Os arquivos usados para configurar e executar o container ficam no host em
 ```text
 /etc/hermes/
 ├── Containerfile
-└── compose.yaml
+├── compose.yaml
+└── hermes-mariadb.conf
 ```
 
 O `Containerfile` parte da imagem `docker.io/nousresearch/hermes-agent:stable`.
 Como `root`, instala `curl`, `ca-certificates`, `tmux`, `git`, `procps`, `sudo`,
-`tree` e `mlocate`, além das ferramentas Antigravity CLI (`agy`), Codex CLI
+`tree`, `plocate` e `mariadb-client` (cliente usado para acessar o MariaDB),
+além das ferramentas Antigravity CLI (`agy`), Codex CLI
 (`codex`), OpenCode (`opencode`) e `ccusage`. O executável do Codex é copiado
 com os links simbólicos resolvidos para `/usr/local/bin/codex` e recebe
 permissão de execução, tornando-o acessível ao usuário `hermes` também. No
@@ -108,7 +119,7 @@ USER root
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        curl ca-certificates tmux git procps sudo tree mlocate \
+        curl ca-certificates tmux git procps sudo tree plocate mariadb-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Antigravity CLI (agy)
@@ -148,14 +159,16 @@ container, sem permissões adicionais, e contém:
 ├── config/
 ├── container/
 ├── data/
+├── mariadb/
 └── workspace/
 ```
 
 Os diretórios `data` e `workspace` são montados no container em `/opt/data` e
 `/workspace`, respectivamente. O compose também monta
 `/home/hermes/data/.gemini/antigravity-cli` em
-`/home/hermes/.gemini/antigravity-cli`. Como o gateway usa `HOME=/opt/data`,
-seu caminho padrão para os dados do Antigravity CLI é `/opt/data/.gemini`; a
+`/home/hermes/.gemini/antigravity-cli`. Como o compose define
+`HOME=/opt/data`, o caminho padrão para os dados do Antigravity CLI é
+`/opt/data/.gemini`; a
 diferença entre esse caminho e o destino do mount está detalhada na seção de
 autenticação abaixo. O diretório `/workspace` é usado como diretório de
 trabalho.
@@ -164,9 +177,25 @@ O conteúdo do `compose.yaml` é:
 
 ```yaml
 services:
+  mariadb:
+    image: docker.io/library/mariadb:11.8
+    container_name: hermes-mariadb
+    env_file:
+      - /etc/hermes/hermes-mariadb.conf
+    volumes:
+      - /home/hermes/mariadb:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   hermes:
     image: localhost/hermes-opencode:2
     container_name: hermes-agent
+    depends_on:
+      - mariadb
 
     userns_mode: "keep-id:uid=10000,gid=10000"
     user: "0:0"
@@ -177,6 +206,7 @@ services:
       - /home/hermes/workspace:/workspace
       - /home/hermes/data/.gemini/antigravity-cli:/home/hermes/.gemini/antigravity-cli
     environment:
+      HOME: /opt/data
       HERMES_DASHBOARD: "1"
       HERMES_DASHBOARD_HOST: "0.0.0.0"
       GH_TOKEN: "" # valor censurado
@@ -189,11 +219,162 @@ services:
 ```
 
 O serviço usa a imagem local `localhost/hermes-opencode:2`, expõe o dashboard
-na porta `9119` somente no endereço local do host e inicia o gateway. O
+na porta `9119` somente no endereço local do host e inicia o gateway. A
+variável `HOME: /opt/data` vale para todo o container, inclusive para comandos
+abertos com `podman exec`; sem ela, o `agy` e o `codex` não encontram as
+credenciais persistidas em `/opt/data` (veja a seção de autenticação). O
 `GH_TOKEN` foi censurado neste registro. Para o GitHub funcionar corretamente,
 o token também foi adicionado diretamente ao arquivo `config.yaml` do Hermes;
 esse arquivo fica na configuração persistida do usuário/container e seu
 conteúdo não foi informado aqui.
+
+## Banco de dados MariaDB
+
+O serviço `mariadb` (container `hermes-mariadb`) usa a imagem oficial
+`docker.io/library/mariadb:11.8` (série LTS) e roda no mesmo Compose do Hermes.
+O `podman-compose` coloca os dois serviços na rede padrão do projeto, onde o
+nome do serviço é resolvido por DNS; assim, o Hermes acessa o banco em
+`mariadb:3306`. A porta não é publicada no host nem em interfaces externas.
+
+### Arquivo de variáveis
+
+As credenciais ficam em `/etc/hermes/hermes-mariadb.conf`, carregado pelo
+`env_file` do serviço. O arquivo é lido pelo Podman como lista de variáveis,
+não por um shell: cada linha deve estar no formato `NOME=valor`, **sem o
+prefixo `export`** e sem aspas (aspas seriam incluídas no valor):
+
+```text
+MARIADB_ROOT_PASSWORD=<senha-root>
+MARIADB_DATABASE=hermes
+MARIADB_USER=hermes
+MARIADB_PASSWORD=<senha-hermes>
+```
+
+Os valores reais foram omitidos neste registro. Para remover o `export` de um
+arquivo já criado e restringir o acesso a ele:
+
+```bash
+sudo sed -i 's/^export //' /etc/hermes/hermes-mariadb.conf
+sudo chown hermes:hermes /etc/hermes/hermes-mariadb.conf
+sudo chmod 600 /etc/hermes/hermes-mariadb.conf
+```
+
+Essas variáveis só são aplicadas na **primeira inicialização**, quando
+`/var/lib/mysql` está vazio: o entrypoint cria o banco `hermes`, o usuário
+`hermes` com acesso a ele e define a senha do `root`. Alterar o arquivo depois
+não muda as senhas já gravadas; para isso, use `ALTER USER` no banco.
+
+### Dados persistidos
+
+Os dados ficam em `/home/hermes/mariadb`, montado em `/var/lib/mysql`. Crie o
+diretório como usuário `hermes` antes do primeiro `up`:
+
+```bash
+sudo -u hermes mkdir -p /home/hermes/mariadb
+```
+
+Dentro do container, o MariaDB roda com o UID `999`, que no Podman rootless é
+mapeado para um UID subordinado do usuário `hermes`. Por isso, no host, os
+arquivos desse diretório aparecem com um dono numérico diferente; para
+inspecioná-los, use `sudo -u hermes podman unshare ls -l /home/hermes/mariadb`.
+
+### Acesso pelo Hermes
+
+O container `hermes-agent` **não recebe as credenciais do banco por variáveis
+de ambiente**: o `env_file` do `compose.yaml` pertence apenas ao serviço
+`mariadb`, e o `EnvironmentFile` do systemd afeta somente o processo
+`podman-compose`. Assim, a senha do `root` não fica exposta no container do
+Hermes.
+
+O acesso usa o usuário `hermes` do banco por meio do arquivo de opções do
+cliente `/home/hermes/data/.my.cnf`, visto no container como
+`/opt/data/.my.cnf`. Como o container usa `HOME=/opt/data`, o cliente `mariadb`
+lê `~/.my.cnf` automaticamente, e o Hermes se conecta sem informar senha na
+linha de comando ou na conversa com o modelo.
+
+#### Conteúdo
+
+```ini
+[client]
+host=mariadb
+port=3306
+user=hermes
+password="<senha-hermes>"
+
+[mysql]
+database=hermes
+```
+
+- `[client]` é lido por todos os clientes (`mariadb`, `mariadb-dump`,
+  `mariadb-admin` etc.); `[mysql]` é lido apenas pelo cliente interativo
+  `mariadb`. O `database` fica em `[mysql]` porque outros clientes, como o
+  `mariadb-dump`, recusam essa opção com o erro `unknown variable`;
+- `host=mariadb` é o nome do serviço no Compose, resolvido pela rede interna;
+- `user`, `password` e `database` devem ser iguais a `MARIADB_USER`,
+  `MARIADB_PASSWORD` e `MARIADB_DATABASE` do `hermes-mariadb.conf`;
+- as aspas em `password` permitem senhas com `#`, `;` ou espaços, que seriam
+  interpretados como comentário ou separador sem elas. O valor dentro das aspas
+  é a senha literal.
+
+#### Criação
+
+A configuração é feita **uma única vez**. Como o arquivo fica em
+`/home/hermes/data`, ele persiste ao recriar o container, ao reconstruir a
+imagem e ao reiniciar o host. Crie-o como usuário `hermes`, com permissão
+`600` desde o início, para que a senha nunca fique legível por outros usuários:
+
+```bash
+sudo -u hermes install -m 600 /dev/null /home/hermes/data/.my.cnf
+sudo -u hermes nano /home/hermes/data/.my.cnf
+```
+
+O dono `hermes` no host corresponde ao UID `10000` no container
+(`userns_mode: keep-id`). O cliente `mariadb` ignora arquivos de opções com
+permissão de escrita para todos; mantenha o modo `600`.
+
+#### Uso
+
+Dentro do container, o cliente usa o arquivo sem argumentos extras:
+
+```bash
+mariadb -e "SHOW TABLES;"
+mariadb-dump hermes > /workspace/hermes.sql
+```
+
+Se algum shell rodar com outro `HOME` (veja a seção de autenticação), defina
+`HOME=/opt/data` ou passe `--defaults-extra-file=/opt/data/.my.cnf`. Bibliotecas
+de aplicações (Python, Node etc.) não leem o `.my.cnf` por padrão; para elas,
+use os mesmos dados na string de conexão, por exemplo
+`mysql://hermes:<senha-hermes>@mariadb:3306/hermes`.
+
+#### Cuidados
+
+- O agente tem acesso ao próprio container e consegue ler o arquivo; o
+  `.my.cnf` evita repetir a senha, mas não a esconde do Hermes. Por isso o
+  acesso usa o usuário `hermes`, restrito ao banco `hermes`, e não o `root`.
+- Ao trocar a senha do usuário com `ALTER USER`, atualize também o `.my.cnf`.
+  O `MARIADB_PASSWORD` do `hermes-mariadb.conf` só é usado na primeira
+  inicialização, mas mantê-lo igual evita confusão em uma restauração.
+
+### Aplicar e validar
+
+Após reconstruir a imagem com o `mariadb-client` (seção “Reconstruir a imagem
+e recriar o container”), suba os serviços e confira o banco e o acesso pelo
+Hermes:
+
+```bash
+sudo -u hermes podman-compose --in-pod=false -f /etc/hermes/compose.yaml up -d --force-recreate
+sudo -u hermes podman exec hermes-mariadb healthcheck.sh --connect --innodb_initialized && echo MARIADB_OK
+sudo -u hermes podman exec hermes-agent mariadb \
+    -e "SELECT CURRENT_USER(), DATABASE(), VERSION();"
+```
+
+Para um console administrativo como `root`, abra o cliente dentro do próprio
+container do banco (a senha é solicitada interativamente):
+
+```bash
+sudo -u hermes podman exec -it hermes-mariadb mariadb -u root -p
+```
 
 ## Acessar a dashboard por túnel SSH
 
@@ -234,6 +415,9 @@ persistidos do container e do ambiente no host. Preservar, no mínimo:
 - `/home/hermes/config/` e `/home/hermes/container/` — configurações prontas
   mantidas nessas pastas;
 - `/home/hermes/data/` — configuração e estado persistido do Hermes;
+- `/home/hermes/mariadb/` — dados do MariaDB; preferir um dump lógico
+  consistente (`mariadb-dump --single-transaction` executado no container
+  `hermes-mariadb`) em vez de copiar os arquivos com o servidor em execução;
 - `/etc/hermes/Containerfile` e `/etc/hermes/compose.yaml` — arquivos usados
   para construir e iniciar o container.
 
@@ -241,7 +425,9 @@ Oferecer dois modos explícitos. No **backup seguro**, preservar os caminhos
 acima, mas ignorar as credenciais `/home/hermes/data/.codex/` e
 `/home/hermes/data/.gemini/` (equivalentes a `/opt/data/.codex/` e
 `/opt/data/.gemini/` dentro do container), além de excluir ou sanitizar
-`/home/hermes/data/config.yaml`, que pode conter o `GH_TOKEN` e outras chaves.
+`/home/hermes/data/config.yaml`, que pode conter o `GH_TOKEN` e outras chaves,
+e as senhas do banco em `/etc/hermes/hermes-mariadb.conf` e
+`/home/hermes/data/.my.cnf`.
 Também ignorar arquivos temporários descartáveis, como
 `/home/hermes/data/cache/scratch/`. O processo deve registrar que as
 credenciais precisarão ser configuradas novamente após a restauração.
@@ -255,10 +441,12 @@ validar a recuperação do ambiente.
 
 ## Autenticação do Codex e do Antigravity CLI
 
-O processo do gateway usa `HOME=/opt/data`; assim, os caminhos padrão das
-credenciais são `/opt/data/.codex` para o Codex e `/opt/data/.gemini` para o
-Antigravity CLI (`agy`). Não é necessário criar links simbólicos nem alterar o
-`HOME` do gateway para essas ferramentas.
+O `compose.yaml` define `HOME: /opt/data` no ambiente do container. Assim, os
+caminhos padrão das credenciais são `/opt/data/.codex` para o Codex e
+`/opt/data/.gemini` para o Antigravity CLI (`agy`), ambos persistidos em
+`/home/hermes/data` no host. Sem essa variável, as ferramentas procuram as
+credenciais em outro diretório e pedem login novamente. Não é necessário criar
+links simbólicos.
 
 O shell auxiliar aberto pela ferramenta de terminal usou incorretamente
 `HOME=/opt/data/home`. Por isso, o `agy` solicitou login nesse shell, embora
@@ -272,9 +460,13 @@ AGY:   AGY_AUTH_OK
 ```
 
 Em um teste anterior, o Codex respondeu “Olá! Como posso ajudar com o projeto?”
-e o AGY retornou `HELLO_AGY`. Até que o shell auxiliar herde o `HOME` correto,
-defina `HOME=/opt/data` ao executar testes nele. Essa diferença de ambiente do
-shell não altera a configuração do gateway.
+e o AGY retornou `HELLO_AGY`. Se o shell auxiliar continuar usando
+`HOME=/opt/data/home` mesmo com a variável definida no compose, defina
+`HOME=/opt/data` ao executar testes nele. Para conferir o valor no container:
+
+```bash
+sudo -u hermes podman exec hermes-agent sh -c 'echo $HOME'
+```
 
 ## Mensageria
 
