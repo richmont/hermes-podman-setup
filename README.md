@@ -236,6 +236,52 @@ O `podman-compose` coloca os dois serviços na rede padrão do projeto, onde o
 nome do serviço é resolvido por DNS; assim, o Hermes acessa o banco em
 `mariadb:3306`. A porta não é publicada no host nem em interfaces externas.
 
+### Endereço do banco dentro do container
+
+Dentro do `hermes-agent`, o banco **não está em `localhost`**: o MariaDB roda
+em outro container, e `127.0.0.1:3306` recusa a conexão. Use sempre:
+
+| Parâmetro | Valor |
+|---|---|
+| Host | `mariadb` |
+| Porta | `3306` |
+
+O `hermes-agent` também não tem acesso ao Podman nem ao Docker. Não é possível,
+nem necessário, inspecionar ou gerenciar o container do banco a partir dele;
+essas tarefas são feitas no host, com `sudo -u hermes podman ...`.
+
+O agente pode ignorar isso e tentar `localhost`, ou concluir que o banco não
+existe. Para evitar, registre a informação na memória do Hermes ou no
+`AGENTS.md` de cada projeto que usa o banco:
+
+```markdown
+## Banco de dados
+
+- MariaDB em `mariadb:3306` (outro container da rede do Compose), nunca
+  `localhost`/`127.0.0.1`. Não há Docker nem Podman neste ambiente.
+- Credenciais no `.env` com o prefixo `PROJETO_`: `PROJETO_DB`,
+  `PROJETO_MARIADB_LOGIN`, `PROJETO_MARIADB_PW` e `PROJETO_URI`. Não exibir
+  os valores.
+- `mariadb` sem argumentos conecta como usuário `hermes` via `~/.my.cnf`
+  (`HOME=/opt/data`); para o banco do projeto, use as credenciais do `.env`.
+```
+
+Para o agente testar o login do usuário de um projeto sem exibir a senha,
+lendo o `.env` com `grep` em vez de `source` (que falharia com valores de
+outras variáveis contendo espaços ou caracteres especiais):
+
+```bash
+cd /workspace/<projeto>
+get() { grep -E "^PROJETO_$1=" .env | tail -n 1 | cut -d= -f2-; }
+MYSQL_PWD=$(get MARIADB_PW) mariadb --no-defaults -h mariadb \
+    -u "$(get MARIADB_LOGIN)" "$(get DB)" -e "SELECT CURRENT_USER(), DATABASE();"
+```
+
+O `--no-defaults` impede que o `.my.cnf` do usuário `hermes` sobreponha a
+senha informada em `MYSQL_PWD`. Ter o banco disponível não muda o código: um
+projeto que usa SQLite continua usando SQLite até ser alterado para ler a
+`PROJETO_URI` com um driver MySQL/MariaDB.
+
 ### Arquivo de variáveis
 
 As credenciais ficam em `/etc/hermes/hermes-mariadb.conf`, carregado pelo
