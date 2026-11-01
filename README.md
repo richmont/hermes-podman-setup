@@ -376,6 +376,214 @@ container do banco (a senha é solicitada interativamente):
 sudo -u hermes podman exec -it hermes-mariadb mariadb -u root -p
 ```
 
+## Checklist de manutenção
+
+Use esta lista após a instalação inicial, depois de reiniciar o host,
+reconstruir a imagem ou alterar `/etc/hermes`, e sempre que algo parecer
+errado. Cada item traz o comando de verificação, o resultado esperado e, quando
+houver, como corrigir. Os resultados de referência são da validação de
+2026-11-01.
+
+### 1. Serviço e containers
+
+- [ ] **Unit do systemd ativa**
+
+  ```bash
+  systemctl status hermes-compose --no-pager
+  ```
+
+  Esperado: `active (exited)`, normal para `Type=oneshot` com
+  `RemainAfterExit=yes`. Se falhou, verifique o motivo com
+  `sudo journalctl -u hermes-compose -n 50 --no-pager` e reinicie com
+  `sudo systemctl restart hermes-compose`.
+
+- [ ] **Linger habilitado para o usuário `hermes`**
+
+  ```bash
+  loginctl show-user hermes -p Linger
+  ```
+
+  Esperado: `Linger=yes`. Sem isso, `/run/user/1001` pode não existir no boot e
+  o Podman rootless falha. Corrija com `sudo loginctl enable-linger hermes`.
+
+- [ ] **Containers em execução**
+
+  ```bash
+  sudo -u hermes podman ps
+  ```
+
+  Esperado: `hermes-mariadb` com status `(healthy)` e `3306/tcp` sem
+  mapeamento para o host; `hermes-agent` com `127.0.0.1:9119->9119/tcp`. O
+  `hermes-agent` leva cerca de dois minutos para iniciar (sincronização de
+  skills e setup do s6), então o tempo de `Up` pode ser menor que o de criação.
+
+- [ ] **Sem reinícios inesperados**
+
+  ```bash
+  sudo -u hermes podman inspect hermes-agent hermes-mariadb \
+      --format '{{.Name}}: {{.RestartCount}} reinícios, último exit: {{.State.ExitCode}}'
+  ```
+
+  Esperado: `0 reinícios, último exit: 0`. Se houver reinícios, consulte os
+  logs (item 2).
+
+### 2. Logs
+
+- [ ] **Gateway e Telegram iniciados**
+
+  ```bash
+  sudo -u hermes podman logs --since 15m hermes-agent 2>&1 | grep -E 'HERMES_DASHBOARD_READY|Telegram\] Connected'
+  ```
+
+  Esperado: `HERMES_DASHBOARD_READY port=9119` e
+  `[Telegram] Connected to Telegram (polling mode)`.
+
+- [ ] **MariaDB sem erros**
+
+  ```bash
+  sudo -u hermes podman logs --since 15m hermes-mariadb 2>&1 | grep -iE 'error|warning'
+  ```
+
+  Esperado: nenhuma linha relevante. Avisos de `Aborted connection` isolados
+  não indicam falha.
+
+### 3. Ambiente e ferramentas do Hermes
+
+- [ ] **`HOME` correto**
+
+  ```bash
+  sudo -u hermes podman exec hermes-agent sh -c 'echo $HOME'
+  ```
+
+  Esperado: `/opt/data`. Se diferente, confira `HOME: /opt/data` no
+  `environment` do `compose.yaml` e recrie o container.
+
+- [ ] **Ferramentas instaladas** — execute os comandos de versão da seção
+  “Reconstruir a imagem e recriar o container” e também:
+
+  ```bash
+  sudo -u hermes podman exec hermes-agent mariadb --version
+  ```
+
+  Se alguma ferramenta faltar, reconstrua a imagem (item 6).
+
+- [ ] **Credenciais do Codex**
+
+  ```bash
+  sudo -u hermes podman exec hermes-agent codex login status
+  ```
+
+  Esperado: `Logged in using ChatGPT`. Se pedir login, confira se
+  `/home/hermes/data/.codex/` existe e se o `HOME` está correto; só então refaça
+  o login.
+
+- [ ] **Credenciais do Antigravity CLI** — confirme que
+  `/home/hermes/data/.gemini/` existe e envie um prompt curto ao `agy`, como no
+  teste descrito na seção de autenticação.
+
+### 4. Banco de dados
+
+- [ ] **MariaDB inicializado**
+
+  ```bash
+  sudo -u hermes podman exec hermes-mariadb healthcheck.sh --connect --innodb_initialized && echo MARIADB_OK
+  ```
+
+  Esperado: `MARIADB_OK`.
+
+- [ ] **Hermes acessa o banco pelo `.my.cnf`**
+
+  ```bash
+  sudo -u hermes podman exec hermes-agent mariadb -e "SELECT CURRENT_USER(), DATABASE(), VERSION();"
+  ```
+
+  Esperado: `hermes@%`, `hermes` e `11.8.x-MariaDB` (referência:
+  `11.8.9-MariaDB-ubu2404`). Em caso de `Access denied`, compare a senha do
+  `.my.cnf` com a do banco; em `Unknown server host 'mariadb'`, confira se os
+  dois containers estão na mesma rede do Compose.
+
+- [ ] **Permissões do usuário `hermes`**
+
+  ```bash
+  sudo -u hermes podman exec hermes-agent mariadb -e "SHOW GRANTS;"
+  ```
+
+  Esperado: somente `GRANT USAGE ON *.*` e `GRANT ALL PRIVILEGES ON hermes.*`.
+  Qualquer privilégio global adicional deve ter sido concedido de propósito.
+
+- [ ] **Teste pelo próprio Hermes** — peça pelo Telegram que ele execute
+  `mariadb -e "SELECT 1"`. Se falhar no shell auxiliar, verifique o `HOME`
+  desse shell (seção de autenticação).
+
+### 5. Arquivos de credenciais
+
+- [ ] **Permissões restritas**
+
+  ```bash
+  sudo stat -c '%a %U:%G %n' /etc/hermes/hermes-mariadb.conf /home/hermes/data/.my.cnf
+  ```
+
+  Esperado: `600 hermes:hermes` nos dois. Corrija com
+  `sudo chown hermes:hermes <arquivo>` e `sudo chmod 600 <arquivo>`.
+
+- [ ] **Formato do arquivo de variáveis**
+
+  ```bash
+  sudo grep -cE '^export |"' /etc/hermes/hermes-mariadb.conf
+  ```
+
+  Esperado: `0`. Remova prefixos `export` com
+  `sudo sed -i 's/^export //' /etc/hermes/hermes-mariadb.conf` e retire
+  aspas manualmente.
+
+### 6. Procedimentos de correção
+
+- **Reiniciar a pilha inteira** (para e remove os containers, depois recria):
+
+  ```bash
+  sudo systemctl restart hermes-compose
+  ```
+
+- **Aplicar mudança no `compose.yaml`** — valide antes de reiniciar:
+
+  ```bash
+  sudo -u hermes podman-compose -f /etc/hermes/compose.yaml config
+  sudo systemctl restart hermes-compose
+  ```
+
+- **Aplicar mudança no `Containerfile`** — reconstrua e reinicie:
+
+  ```bash
+  sudo -u hermes podman build -t localhost/hermes-opencode:2 -f /etc/hermes/Containerfile /etc/hermes
+  sudo systemctl restart hermes-compose
+  ```
+
+- **Aplicar mudança na unit do systemd**:
+
+  ```bash
+  sudo systemd-analyze verify /etc/systemd/system/hermes-compose.service
+  sudo systemctl daemon-reload
+  sudo systemctl restart hermes-compose
+  ```
+
+- **Refazer a inicialização do MariaDB** — apaga **todos os dados do banco**.
+  Use apenas em instalação nova ou se a primeira inicialização falhou (por
+  exemplo, com senha vazia), pois as variáveis do `hermes-mariadb.conf` só são
+  aplicadas com o diretório vazio:
+
+  ```bash
+  sudo systemctl stop hermes-compose
+  sudo -u hermes podman unshare rm -rf /home/hermes/mariadb/*
+  sudo systemctl start hermes-compose
+  ```
+
+- **Trocar a senha do usuário `hermes` do banco** — como `root` no
+  `hermes-mariadb`, depois atualize o `.my.cnf` e o `MARIADB_PASSWORD`:
+
+  ```sql
+  ALTER USER 'hermes'@'%' IDENTIFIED BY '<nova-senha>';
+  ```
+
 ## Acessar a dashboard por túnel SSH
 
 A dashboard está publicada pelo Podman apenas em `127.0.0.1:9119` no host, sem
