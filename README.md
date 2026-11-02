@@ -579,6 +579,99 @@ DROP DATABASE `<banco>`;
 DROP USER '<usuario>'@'%';
 ```
 
+## Fuso horário
+
+O host e os containers rodam em UTC (`date` no `hermes-agent` retorna
+`UTC +0000`, verificado em 2026-11-02). O Hermes tem um fuso próprio, que vale
+para o agendamento dos jobs de cron e para o horário que o agente recebe no
+prompt; ele não muda o horário dos logs, que seguem o relógio do container.
+O fuso adotado é `America/Belem` (GMT-3, sem horário de verão).
+
+### Configuração
+
+O Hermes lê o fuso de duas fontes, nesta ordem de prioridade:
+
+1. variável de ambiente `HERMES_TIMEZONE`;
+2. chave `timezone` do `config.yaml` (`/home/hermes/data/config.yaml`).
+
+Hoje o valor está na chave `timezone`, aplicada em 2026-11-02 com
+`hermes config set timezone America/Belem`. Ela persiste em `/home/hermes/data`
+quando a imagem é reconstruída ou o container é recriado, mas se perde numa
+instalação nova ou numa restauração do backup seguro, que exclui o
+`config.yaml`. Para o fuso fazer parte do setup reproduzível, defina também a
+variável no `environment` do serviço `hermes` no `compose.yaml`:
+
+```yaml
+    environment:
+      HOME: /opt/data
+      HERMES_TIMEZONE: America/Belem
+```
+
+Aplique validando antes, como na seção de procedimentos de correção:
+
+```bash
+sudo -u hermes podman-compose -f /etc/hermes/compose.yaml config
+sudo systemctl restart hermes-compose
+```
+
+Use sempre um nome IANA (`America/Belem`), não um deslocamento como `GMT-3`.
+Um nome inválido não gera erro: o Hermes registra um aviso no log e volta
+silenciosamente para o horário do container (UTC).
+
+### Jobs de cron
+
+As expressões de cron são interpretadas no fuso do Hermes, então `0 6 * * *`
+dispara às 06:00 de Belém. Jobs de intervalo (`every 5m`, `every 720m`) não
+dependem do fuso. Referência dos jobs com horário fixo em 2026-11-02, já
+escritos em horário local:
+
+| Job | Expressão | Horário real |
+|---|---|---|
+| DeepSeek off-peak começa 01:00 | `0 1 * * 1-5` | seg–sex 01:00 |
+| DeepSeek off-peak termina 03:00 | `0 3 * * 1-5` | seg–sex 03:00 |
+| DeepSeek off-peak começa 07:00 | `0 7 * * 1-5` | seg–sex 07:00 |
+| DeepSeek off-peak termina 22:00 | `0 22 * * 0-4` | dom–qui 22:00 |
+| PeraiMotora relatório favoritas | `0 6 * * *` | todo dia 06:00 |
+
+Numa instalação nova sem o fuso configurado, o Hermes usa UTC e essas
+expressões disparam 3 horas mais cedo. Configure o fuso **antes** de recriar
+os jobs.
+
+### Trocar o fuso com jobs existentes
+
+O gateway guarda o fuso em cache e só o relê ao reiniciar. Para trocar:
+
+1. Liste os jobs com `hermes cron list --all` e converta cada expressão de
+   horário fixo para manter o mesmo horário real. Cuidado com a virada do dia:
+   `0 1 * * 1-5` em UTC é 22:00 da véspera em Belém, ou seja, `0 22 * * 0-4`.
+2. Aplique o novo fuso e edite os jobs em sequência, com
+   `hermes cron edit <id> --schedule "<expressão>"`.
+3. Reinicie o gateway logo em seguida
+   (`sudo -u hermes podman restart hermes-agent`), evitando o minuto de algum
+   disparo.
+4. Confira os próximos disparos com `hermes cron list`. Um job que disparou
+   entre a troca e o restart grava o horário seguinte calculado com o fuso
+   antigo; repita o `hermes cron edit` desse job depois do restart.
+
+### Fuso do sistema (opcional)
+
+Para que `date` e os logs do `hermes-agent` também mostrem o horário de Belém,
+acrescente `TZ: America/Belem` ao `environment` do serviço `hermes`. Antes,
+confirme que a imagem tem a base de fusos:
+
+```bash
+sudo -u hermes podman exec hermes-agent sh -c 'TZ=America/Belem date'
+```
+
+Se a saída continuar em UTC, inclua `tzdata` no `apt-get install` do
+`Containerfile`. Scripts que usam a hora local sem fuso explícito passam a
+receber GMT-3; os que gravam em UTC explicitamente, como o coletor do
+PeraiMotora (`datetime.now(timezone.utc)` e `UTC_TIMESTAMP()`), não mudam.
+
+**Não altere o fuso do `hermes-mariadb`.** O banco deve continuar em UTC: com
+outro fuso, `NOW()` e `CURRENT_TIMESTAMP` passam a gravar horário local, e
+projetos que assumem horários em UTC ficam inconsistentes.
+
 ## Checklist de manutenção
 
 Use esta lista após a instalação inicial, depois de reiniciar o host,
@@ -660,6 +753,18 @@ houver, como corrigir. Os resultados de referência são da validação de
 
   Esperado: `/opt/data`. Se diferente, confira `HOME: /opt/data` no
   `environment` do `compose.yaml` e recrie o container.
+
+- [ ] **Fuso do Hermes**
+
+  ```bash
+  sudo -u hermes podman exec hermes-agent sh -c 'echo "env=${HERMES_TIMEZONE:-vazio}"; hermes config get timezone'
+  sudo -u hermes podman exec hermes-agent hermes cron list
+  ```
+
+  Esperado: `America/Belem` na variável ou no `config.yaml`, e os próximos
+  disparos dos jobs de horário fixo nos horários da tabela da seção “Fuso
+  horário”. Se o fuso estiver vazio, os jobs disparam 3 horas mais cedo; siga
+  “Trocar o fuso com jobs existentes”.
 
 - [ ] **Ferramentas instaladas** — execute os comandos de versão da seção
   “Reconstruir a imagem e recriar o container” e também:
@@ -841,7 +946,9 @@ e as senhas do banco em `/etc/hermes/hermes-mariadb.conf` e
 `/home/hermes/data/.my.cnf`.
 Também ignorar arquivos temporários descartáveis, como
 `/home/hermes/data/cache/scratch/`. O processo deve registrar que as
-credenciais precisarão ser configuradas novamente após a restauração.
+credenciais precisarão ser configuradas novamente após a restauração, assim
+como os ajustes guardados só no `config.yaml`, como o fuso (`timezone`), se
+ele não estiver também no `compose.yaml` (veja “Fuso horário”).
 
 No **backup inseguro**, incluir também esses diretórios de credenciais e o
 `config.yaml` original para restaurar a autenticação e as configurações sem
